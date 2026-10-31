@@ -226,7 +226,7 @@ class BinanceOneGateway(BaseGateway):
             symbol=symbol,
             exchange=Exchange(exchange),
             interval=Interval.MINUTE,
-            start=datetime.now(TZ_INFO) - timedelta(minutes=1440),
+            start=datetime.now(TZ_INFO) - timedelta(minutes= 100),
             end=datetime.now(TZ_INFO),
             #start=datetime(2026,8,5,tzinfo=TZ_INFO),
             #end=datetime(2026,10,27,tzinfo=TZ_INFO),
@@ -375,7 +375,7 @@ class BinanceOneRestApi(RestClient):
             api.start()
         self.query_time()
         self.query_contract()
-        self.gateway.write_log("BINANCEONE REST API启动，正在同步时间和查询三类市场合约")
+        self.gateway.write_log("REST API启动，正在同步时间和查询三类市场合约")
 
     def query_time(self) -> Request:
         self.last_time_query = monotonic()
@@ -952,7 +952,7 @@ class BinanceOneRestApi(RestClient):
             from vnpy.trader.database import database_manager
             try:
                 database_manager.save_bar_data(history, False)
-                self.gateway.write_log(f"载入{req.vt_symbol}历史数据{len(history)}条，耗时{monotonic() - started:.3f}秒")
+                self.gateway.write_log(f"载入{req.vt_symbol}：bar数据，开始时间：{history[0].datetime}，结束时间：{history[-1].datetime}，数据量：{len(history)}，耗时{monotonic() - started:.3f}秒")
             except Exception as exc:
                 self.gateway.write_log(f"{req.vt_symbol}历史数据保存失败：{exc}")
 
@@ -1131,7 +1131,7 @@ class BinanceOneDataWebsocketApi:
                 tick.open_price, tick.high_price = float(data["o"]), float(data["h"])
                 tick.low_price, tick.last_price = float(data["l"]), float(data["c"])
             elif channel.startswith("depth"):
-                bids, asks = data.get("b",data["bids"]), data.get("a",data["asks"])
+                bids, asks = data.get("b") or data["bids"], data.get("a") or data["asks"]
                 for side, levels in (("bid", bids), ("ask", asks)):
                     for index in range(5):
                         price, volume = levels[index]
@@ -1233,4 +1233,3 @@ class BinanceOneMarketWebsocketApi(WebsocketClient):
 
         if symbol:
             self.api.on_data(self.exchange, symbol, channel, data)
-
