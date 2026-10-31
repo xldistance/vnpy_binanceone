@@ -271,6 +271,7 @@ class BinanceOneGateway(BaseGateway):
             return
         if self.rest_api.account_dirty and monotonic() >= self.rest_api.next_account_query:
             self.query_account()
+        self.rest_api.repay_margin_debt()
         if self.leverage_contract:
             symbol, exchange, _ = extract_vt_symbol(self.leverage_contract.pop(0))
             if exchange in FUTURES_EXCHANGES:
@@ -305,6 +306,9 @@ class BinanceOneRestApi(RestClient):
         self.accounts_info: dict[str, dict] = {}
         self.balances: dict[str, dict] = {}
         self.balance_version = 0
+        self.next_margin_repay = 0.0
+        self.margin_repay_pending = False
+        self.margin_repay_assets = ["USDT", "USDC"]
         self.spot_assets: dict[str, str] = {}
         self.contracts: dict[tuple[Exchange, str], ContractData] = {}
         self.position_symbols = {exchange: set() for exchange in FUTURES_EXCHANGES}
@@ -318,6 +322,8 @@ class BinanceOneRestApi(RestClient):
         self.stream_pending = False
         self.user_stream_key = ""
         self.next_stream_action = 0
+        self.margin_repay_pending = False
+        self.next_margin_repay = 0.0
         super().stop()
         for api in self.public_rest_apis.values():
             api.stop()
@@ -358,6 +364,9 @@ class BinanceOneRestApi(RestClient):
         self.stream_pending = False
         self.user_stream_key = ""
         self.next_stream_action = 0
+        self.margin_repay_pending = False
+        self.next_margin_repay = 0.0
+        self.margin_repay_assets = ["USDT", "USDC"]
         self.position_modes = dict.fromkeys(FUTURES_EXCHANGES)
         self.init(REST_HOST, proxy_host, proxy_port, gateway_name=self.gateway_name)
         self.start()
@@ -380,6 +389,7 @@ class BinanceOneRestApi(RestClient):
         if self.time_synced or not self.gateway.connected:
             return
         self.time_synced = True
+        self.next_margin_repay = monotonic() + 60
         for exchange in FUTURES_EXCHANGES:
             self.add_request(
                 "GET", f"/papi/v1/{MARKET_NAMES[exchange]}/positionSide/dual",
@@ -443,6 +453,52 @@ class BinanceOneRestApi(RestClient):
         if exchange == Exchange.BINANCE:
             self.push_spot_positions()
         self.gateway.write_log(f"BINANCEONE {exchange.value}合约信息查询成功")
+
+    def repay_margin_debt(self) -> Request | None:
+        """每60秒轮流全额偿还稳定币负债；每轮最多一次，避免耗尽6000/分钟权重。"""
+        if not self.gateway.connected or not self.time_synced:
+            return None
+        now = monotonic()
+        with self.state_lock:
+            if self.margin_repay_pending or now < self.next_margin_repay:
+                return None
+            self.next_margin_repay = now + 60
+            for _ in range(len(self.margin_repay_assets)):
+                asset = self.margin_repay_assets.pop(0)
+                self.margin_repay_assets.append(asset)
+                raw = self.balances.get(asset, {})
+                debt = Decimal(raw.get("crossMarginBorrowed") or "0") + Decimal(raw.get("crossMarginInterest") or "0")
+                if debt > 0:
+                    self.margin_repay_pending = True
+                    break
+            else:
+                return None
+        # 省略amount表示全额还款，仍受单次50000 USD上限及可用还款资产限制。
+        return self.add_request(
+            "POST", "/papi/v1/margin/repay-debt", callback=self.on_repay_margin_debt,
+            params={"asset": asset}, data={"security": Security.SIGNED}, extra=asset,
+            on_failed=self.on_repay_margin_debt_failed, on_error=self.on_repay_margin_debt_error,
+        )
+
+    def on_repay_margin_debt(self, data: dict, request: Request) -> None:
+        self.margin_repay_pending = False
+        self.account_dirty = True
+        if is_true(data.get("success")):
+            self.gateway.write_log(f"BINANCEONE {request.extra}杠杆还款成功，金额：{data.get('amount', '未知')}")
+        else:
+            self.gateway.write_log(f"BINANCEONE {request.extra}杠杆还款未成功：{data}")
+
+    def on_repay_margin_debt_failed(self, status_code: int, request: Request) -> None:
+        self.margin_repay_pending = False
+        self.account_dirty = True
+        self.gateway.write_log(f"BINANCEONE {request.extra}杠杆还款请求失败，将刷新账户并在后续轮次重新检查")
+        self.on_failed(status_code, request)
+
+    def on_repay_margin_debt_error(self, exception_type: type, exception_value: Exception, tb, request: Request) -> None:
+        self.margin_repay_pending = False
+        self.account_dirty = True
+        self.gateway.write_log(f"BINANCEONE {request.extra}杠杆还款结果未知，将刷新账户并在后续轮次重新检查")
+        self.on_error(exception_type, exception_value, tb, request)
 
     def query_account(self) -> None:
         if not self.time_synced:
@@ -702,9 +758,12 @@ class BinanceOneRestApi(RestClient):
         if time_condition:
             params.update(price=format_number(req.price), timeInForce=time_condition)
         if req.exchange == Exchange.BINANCE:
-            # 无持币可按需借币卖空，成交所得资产自动偿还同币种负债。
-            params["sideEffectType"] = "AUTO_BORROW_REPAY"
-            params["autoRepayAtCancel"] = "true"
+            # 只有开仓才允许自动借币
+            if req.offset == Offset.OPEN:
+                params["sideEffectType"] = "AUTO_BORROW_REPAY"
+                params["autoRepayAtCancel"] = "true"
+            else:
+                params["sideEffectType"] = "AUTO_REPAY"
         else:
             params["positionSide"] = "BOTH"
             if req.offset in CLOSE_OFFSETS:
@@ -1064,7 +1123,7 @@ class BinanceOneDataWebsocketApi:
             tick = self.ticks.get(vt_symbol)
             if tick is None:
                 return
-            timestamp = data.get("T",data["E"])     #T 成交时间，E事件时间，首选T，T缺失再选E
+            timestamp = data.get("T",data.get("E",self.gateway.rest_api.get_timestamp()))     #T 成交时间，E事件时间，首选T，T缺失再选E
             tick.datetime = generate_datetime(timestamp) if timestamp else datetime.now(TZ_INFO)
             if channel == "miniTicker":
                 # CM的v是张数、q是基础币数量；现货和UM的v才是基础币数量。
@@ -1072,7 +1131,7 @@ class BinanceOneDataWebsocketApi:
                 tick.open_price, tick.high_price = float(data["o"]), float(data["h"])
                 tick.low_price, tick.last_price = float(data["l"]), float(data["c"])
             elif channel.startswith("depth"):
-                bids, asks = data["b"], data["a"]
+                bids, asks = data.get("b",data["bids"]), data.get("a",data["asks"])
                 for side, levels in (("bid", bids), ("ask", asks)):
                     for index in range(5):
                         price, volume = levels[index]
