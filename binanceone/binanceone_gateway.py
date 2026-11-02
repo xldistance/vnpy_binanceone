@@ -149,16 +149,16 @@ class BinanceOneGateway(BaseGateway):
         self.trade_ws_api = BinanceOneTradeWebsocketApi(self)
         self.market_ws_api = BinanceOneDataWebsocketApi(self)
         self.rest_api = BinanceOneRestApi(self)
-        self.recording_list = [
-            vt_symbol for vt_symbol in self.get_file_path.recording_list
-            if is_target_contract(vt_symbol, self.gateway_name)
-        ]
+        self.recording_list = [vt_symbol for vt_symbol in self.get_file_path.recording_list if is_target_contract(vt_symbol, self.gateway_name)]
         self.history_contract = copy(self.recording_list)
         self.leverage_contract = copy(self.recording_list)
         self.query_count = 0
         self.query_functions = [self.query_account, self.query_position, self.query_order]
+        # 下载历史数据状态
         self.history_status = True
+        # 识别mmap发布进程状态
         self.publish_status = True
+        # 订阅逐笔成交数据状态
         self.book_trade_status = False
         self.connected = False
 
@@ -226,10 +226,10 @@ class BinanceOneGateway(BaseGateway):
             symbol=symbol,
             exchange=Exchange(exchange),
             interval=Interval.MINUTE,
-            start=datetime.now(TZ_INFO) - timedelta(minutes= 100),
+            start=datetime.now(TZ_INFO) - timedelta(minutes=100),
             end=datetime.now(TZ_INFO),
-            #start=datetime(2026,8,5,tzinfo=TZ_INFO),
-            #end=datetime(2026,10,27,tzinfo=TZ_INFO),
+            # start=datetime(2026,4,25,tzinfo=TZ_INFO),
+            # end=datetime(2026,11,1,tzinfo=TZ_INFO),
             gateway_name=self.gateway_name,
         )
         self.rest_api.query_history(req)
@@ -248,10 +248,7 @@ class BinanceOneGateway(BaseGateway):
 
     def get_active_orders(self, exchange: Exchange) -> list[OrderData]:
         with self.order_lock:
-            return [
-                copy(order) for order in self.orders.values()
-                if order.exchange == exchange and order.status not in TERMINAL_STATUSES
-            ]
+            return [copy(order) for order in self.orders.values() if order.exchange == exchange and order.status not in TERMINAL_STATUSES]
 
     def close(self) -> None:
         self.connected = False
@@ -314,7 +311,7 @@ class BinanceOneRestApi(RestClient):
         self.position_symbols = {exchange: set() for exchange in FUTURES_EXCHANGES}
         self.position_versions: dict[tuple[Exchange, str], int] = {}
         self.position_modes: dict[Exchange, bool | None] = dict.fromkeys(FUTURES_EXCHANGES)
-        self.order_count:int = 0
+        self.order_count: int = 0
         self.state_lock = RLock()
 
     def stop(self) -> None:
@@ -366,7 +363,7 @@ class BinanceOneRestApi(RestClient):
         self.next_stream_action = 0
         self.margin_repay_pending = False
         self.next_margin_repay = 0.0
-        self.margin_repay_assets = ["USDT", "USDC"]
+        self.margin_repay_assets = ["BTC", "ETH"]  # 杠杆交易合约
         self.position_modes = dict.fromkeys(FUTURES_EXCHANGES)
         self.init(REST_HOST, proxy_host, proxy_port, gateway_name=self.gateway_name)
         self.start()
@@ -380,8 +377,12 @@ class BinanceOneRestApi(RestClient):
     def query_time(self) -> Request:
         self.last_time_query = monotonic()
         return self.public_rest_apis[Exchange.BINANCE].add_request(
-            "GET", "/api/v3/time", callback=self.on_query_time, extra=int(time() * 1000),
-            on_failed=self.on_failed, on_error=self.on_error,
+            "GET",
+            "/api/v3/time",
+            callback=self.on_query_time,
+            extra=int(time() * 1000),
+            on_failed=self.on_failed,
+            on_error=self.on_error,
         )
 
     def on_query_time(self, data: dict, request: Request) -> None:
@@ -389,28 +390,35 @@ class BinanceOneRestApi(RestClient):
         if self.time_synced or not self.gateway.connected:
             return
         self.time_synced = True
-        self.next_margin_repay = monotonic() + 60
+        self.next_margin_repay = monotonic() + 10 * 60
+        # 设置合约单向持仓，已设置单向持仓回调在on_position_mode_failed
         for exchange in FUTURES_EXCHANGES:
             self.add_request(
-                "GET", f"/papi/v1/{MARKET_NAMES[exchange]}/positionSide/dual",
-                callback=self.on_query_position_mode, data={"security": Security.SIGNED}, extra=exchange,
+                "POST",
+                f"/papi/v1/{MARKET_NAMES[exchange]}/positionSide/dual",
+                callback=self.on_position_mode,
+                on_failed=self.on_position_mode_failed,
+                params={"dualSidePosition": "false"},
+                data={"security": Security.SIGNED},
+                extra=exchange,
             )
-        self.query_account()
-        self.query_position()
-        self.query_order()
         self.start_user_stream()
 
-    def on_query_position_mode(self, data: dict, request: Request) -> None:
-        exchange = request.extra
-        self.position_modes[exchange] = is_true(data["dualSidePosition"])
-        if self.position_modes[exchange]:
-            self.gateway.write_log(f"{exchange.value}处于双向持仓模式，禁止该市场下单；请先在币安切换为单向持仓")
+    def on_position_mode(self, data: dict, request: Request) -> None:
+        return
+
+    def on_position_mode_failed(self, data: dict, request: Request) -> None:
+        return
 
     def query_contract(self) -> None:
         for exchange, path in PUBLIC_PATHS.items():
             self.public_rest_apis[exchange].add_request(
-                "GET", path + "/exchangeInfo", callback=self.on_query_contract, extra=exchange,
-                on_failed=self.on_failed, on_error=self.on_error,
+                "GET",
+                path + "/exchangeInfo",
+                callback=self.on_query_contract,
+                extra=exchange,
+                on_failed=self.on_failed,
+                on_error=self.on_error,
             )
 
     def on_query_contract(self, data: dict, request: Request) -> None:
@@ -430,20 +438,25 @@ class BinanceOneRestApi(RestClient):
             filters = {item["filterType"]: item for item in raw["filters"]}
             price_filter, lot_filter = filters.get("PRICE_FILTER", {}), filters.get("LOT_SIZE", {})
             contract = ContractData(
-                symbol=raw["symbol"], name=raw["symbol"], exchange=exchange,
+                symbol=raw["symbol"],
+                name=raw["symbol"],
+                exchange=exchange,
                 product=Product.SPOT if exchange == Exchange.BINANCE else Product.FUTURES,
                 size=float(raw["contractSize"]) if exchange == Exchange.BINANCEF else 1,
                 price_tick=float(price_filter.get("tickSize", 0)),
                 min_volume=float(lot_filter.get("minQty", 0)),
                 max_volume=float(lot_filter.get("maxQty", 0)),
                 min_price=float(price_filter.get("minPrice", 0)),
-                max_price=float(price_filter.get("maxPrice", 0)), gateway_name=self.gateway_name,
+                max_price=float(price_filter.get("maxPrice", 0)),
+                gateway_name=self.gateway_name,
             )
             contract.name = get_symbol_mark(contract.vt_symbol)
             contract.extra = {
-                "base_asset": raw["baseAsset"], "quote_asset": raw["quoteAsset"],
+                "base_asset": raw["baseAsset"],
+                "quote_asset": raw["quoteAsset"],
                 "margin_asset": raw.get("marginAsset", raw["quoteAsset"]),
-                "min_qty": lot_filter.get("minQty", "0"), "filters": filters,
+                "min_qty": lot_filter.get("minQty", "0"),
+                "filters": filters,
             }
             with self.state_lock:
                 self.contracts[(exchange, contract.symbol)] = contract
@@ -455,35 +468,44 @@ class BinanceOneRestApi(RestClient):
         self.gateway.write_log(f"BINANCEONE {exchange.value}合约信息查询成功")
 
     def repay_margin_debt(self) -> Request | None:
-        """每60秒轮流全额偿还稳定币负债；每轮最多一次，避免耗尽6000/分钟权重。"""
+        """每10分钟轮流全额偿还稳定币负债；每轮最多一次，避免耗尽6000/分钟权重。"""
         if not self.gateway.connected or not self.time_synced:
             return None
         now = monotonic()
         with self.state_lock:
             if self.margin_repay_pending or now < self.next_margin_repay:
                 return None
-            self.next_margin_repay = now + 60
+            self.next_margin_repay = now + 10 * 60
             for _ in range(len(self.margin_repay_assets)):
                 asset = self.margin_repay_assets.pop(0)
                 self.margin_repay_assets.append(asset)
                 raw = self.balances.get(asset, {})
-                debt = Decimal(raw.get("crossMarginBorrowed") or "0") + Decimal(raw.get("crossMarginInterest") or "0")
-                if debt > 0:
+                debt = Decimal(raw["crossMarginBorrowed"])
+                repay_assets = "USDT"  # 还款资产
+                # 只自动还款欠债小于最小委托量的债务，防止还款正常下单交易的仓位
+                min_volume = self.contracts[(Exchange.BINANCE, f"{asset}{repay_assets}")].min_volume
+                if 0 < debt < min_volume:
                     self.margin_repay_pending = True
                     break
             else:
                 return None
         # 省略amount表示全额还款，仍受单次50000 USD上限及可用还款资产限制。
+        # asset欠款资产，specifyRepayAssets指定还款资产
         return self.add_request(
-            "POST", "/papi/v1/margin/repay-debt", callback=self.on_repay_margin_debt,
-            params={"asset": asset}, data={"security": Security.SIGNED}, extra=asset,
-            on_failed=self.on_repay_margin_debt_failed, on_error=self.on_repay_margin_debt_error,
+            "POST",
+            "/papi/v1/margin/repay-debt",
+            callback=self.on_repay_margin_debt,
+            params={"asset": asset, "specifyRepayAssets": repay_assets},
+            data={"security": Security.SIGNED},
+            extra=asset,
+            on_failed=self.on_repay_margin_debt_failed,
+            on_error=self.on_repay_margin_debt_error,
         )
 
     def on_repay_margin_debt(self, data: dict, request: Request) -> None:
         self.margin_repay_pending = False
         self.account_dirty = True
-        if is_true(data.get("success")):
+        if data["success"]:
             self.gateway.write_log(f"BINANCEONE {request.extra}杠杆还款成功，金额：{data.get('amount', '未知')}")
         else:
             self.gateway.write_log(f"BINANCEONE {request.extra}杠杆还款未成功：{data}")
@@ -506,12 +528,19 @@ class BinanceOneRestApi(RestClient):
         self.account_dirty = False
         self.next_account_query = monotonic() + 5
         self.add_request(
-            "GET", "/papi/v1/balance", callback=self.on_query_balance,
-            data={"security": Security.SIGNED}, on_failed=self.on_account_failed, extra=self.balance_version,
+            "GET",
+            "/papi/v1/balance",
+            callback=self.on_query_balance,
+            data={"security": Security.SIGNED},
+            on_failed=self.on_account_failed,
+            extra=self.balance_version,
         )
         self.add_request(
-            "GET", "/papi/v1/account", callback=self.on_query_account,
-            data={"security": Security.SIGNED}, on_failed=self.on_account_failed,
+            "GET",
+            "/papi/v1/account",
+            callback=self.on_query_account,
+            data={"security": Security.SIGNED},
+            on_failed=self.on_account_failed,
         )
 
     def on_query_balance(self, data: list | dict, request: Request) -> None:
@@ -533,7 +562,8 @@ class BinanceOneRestApi(RestClient):
                     available=float(row.get("crossMarginFree") or 0),
                     frozen=float(row.get("crossMarginLocked") or 0),
                     position_profit=float(row.get("umUnrealizedPNL") or 0) + float(row.get("cmUnrealizedPNL") or 0),
-                    datetime=datetime.now(TZ_INFO), file_name=self.gateway.account_file_name,
+                    datetime=datetime.now(TZ_INFO),
+                    file_name=self.gateway.account_file_name,
                     gateway_name=self.gateway_name,
                 )
                 account.extra = dict(row)
@@ -549,9 +579,13 @@ class BinanceOneRestApi(RestClient):
         equity, margin = float(data["accountEquity"]), float(data["accountInitialMargin"])
         available = data.get("totalAvailableBalance")
         account = AccountData(
-            accountid=f"USD_{self.gateway_name}", balance=equity, margin=margin,
+            accountid=f"USD_{self.gateway_name}",
+            balance=equity,
+            margin=margin,
             available=float(available) if available not in (None, "") else max(0, equity - margin),
-            datetime=datetime.now(TZ_INFO), file_name=self.gateway.account_file_name, gateway_name=self.gateway_name,
+            datetime=datetime.now(TZ_INFO),
+            file_name=self.gateway.account_file_name,
+            gateway_name=self.gateway_name,
         )
         account.extra = dict(data, available_estimated=available in (None, ""), account_scope="portfolio")
         self.gateway.on_account(account)
@@ -595,10 +629,7 @@ class BinanceOneRestApi(RestClient):
             error_monitor.last_text = ""
 
     def get_spot_symbols(self) -> set[str]:
-        symbols = {
-            req.symbol for req in list(self.gateway.market_ws_api.subscribed.values())
-            if req.exchange == Exchange.BINANCE
-        }
+        symbols = {req.symbol for req in list(self.gateway.market_ws_api.subscribed.values()) if req.exchange == Exchange.BINANCE}
         for vt_symbol in self.gateway.recording_list:
             symbol, exchange, _ = extract_vt_symbol(vt_symbol)
             if exchange == Exchange.BINANCE:
@@ -629,8 +660,11 @@ class BinanceOneRestApi(RestClient):
             with self.state_lock:
                 versions = self.position_versions.copy()
             self.add_request(
-                "GET", f"/papi/v1/{MARKET_NAMES[exchange]}/positionRisk", callback=self.on_query_position,
-                data={"security": Security.SIGNED}, extra={"exchange": exchange, "versions": versions},
+                "GET",
+                f"/papi/v1/{MARKET_NAMES[exchange]}/positionRisk",
+                callback=self.on_query_position,
+                data={"security": Security.SIGNED},
+                extra={"exchange": exchange, "versions": versions},
             )
 
     def on_query_position(self, data: list, request: Request) -> None:
@@ -638,10 +672,7 @@ class BinanceOneRestApi(RestClient):
         versions = request.extra["versions"]
         holding_symbols = {row["symbol"] for row in data}
         with self.state_lock:
-            stale_symbols = {
-                symbol for symbol in holding_symbols
-                if self.position_versions.get((exchange, symbol), 0) != versions.get((exchange, symbol), 0)
-            }
+            stale_symbols = {symbol for symbol in holding_symbols if self.position_versions.get((exchange, symbol), 0) != versions.get((exchange, symbol), 0)}
             hedge_symbols = {row["symbol"] for row in data if row.get("positionSide", "BOTH") != "BOTH"}
 
             for row in data:
@@ -651,14 +682,15 @@ class BinanceOneRestApi(RestClient):
                 if symbol in hedge_symbols and row.get("positionSide", "BOTH") == "BOTH":
                     continue
                 self.create_position_pair(
-                    symbol, exchange, float(row["positionAmt"]), float(row["entryPrice"]),
-                    float(row["unRealizedProfit"]), position_side=row.get("positionSide", "BOTH"),
+                    symbol,
+                    exchange,
+                    float(row["positionAmt"]),
+                    float(row["entryPrice"]),
+                    float(row["unRealizedProfit"]),
+                    position_side=row.get("positionSide", "BOTH"),
                 )
             # 只能清零本市场且查询发起后没有收到增量更新的持仓。
-            watched = {
-                req.symbol for req in list(self.gateway.market_ws_api.subscribed.values())
-                if req.exchange == exchange
-            }
+            watched = {req.symbol for req in list(self.gateway.market_ws_api.subscribed.values()) if req.exchange == exchange}
             missing = self.position_symbols[exchange] | watched
             for symbol in missing - holding_symbols:
                 key = (exchange, symbol)
@@ -667,8 +699,14 @@ class BinanceOneRestApi(RestClient):
             self.position_symbols[exchange].update(holding_symbols)
 
     def create_position_pair(
-        self, symbol: str, exchange: Exchange, volume: float, avg_price: float,
-        unrealized_pnl: float, frozen: float = 0, position_side: str = "BOTH",
+        self,
+        symbol: str,
+        exchange: Exchange,
+        volume: float,
+        avg_price: float,
+        unrealized_pnl: float,
+        frozen: float = 0,
+        position_side: str = "BOTH",
     ) -> None:
         with self.state_lock:
             key = (exchange, symbol)
@@ -685,12 +723,18 @@ class BinanceOneRestApi(RestClient):
                 directions = [Direction.LONG, Direction.SHORT]
             for side in directions:
                 has_position = side == direction and volume != 0
-                self.gateway.on_position(PositionData(
-                    symbol=symbol, exchange=exchange, direction=side,
-                    volume=abs(volume) if has_position else 0,
-                    price=avg_price if has_position else 0, pnl=unrealized_pnl if has_position else 0,
-                    frozen=min(abs(volume), frozen) if has_position else 0, gateway_name=self.gateway_name,
-                ))
+                self.gateway.on_position(
+                    PositionData(
+                        symbol=symbol,
+                        exchange=exchange,
+                        direction=side,
+                        volume=abs(volume) if has_position else 0,
+                        price=avg_price if has_position else 0,
+                        pnl=unrealized_pnl if has_position else 0,
+                        frozen=min(abs(volume), frozen) if has_position else 0,
+                        gateway_name=self.gateway_name,
+                    )
+                )
 
     def query_order(self) -> None:
         if not self.time_synced:
@@ -698,19 +742,18 @@ class BinanceOneRestApi(RestClient):
         for exchange, market in MARKET_NAMES.items():
             active = self.gateway.get_active_orders(exchange)
             if exchange == Exchange.BINANCE:
-                # margin/openOrders 无symbol会按全市场收取权重，轮询仅查跟踪币对。
-                symbols = self.get_spot_symbols() | {order.symbol for order in active}
-                for symbol in symbols:
-                    self.add_request(
-                        "GET", "/papi/v1/margin/openOrders", callback=self.on_query_order,
-                        params={"symbol": symbol}, data={"security": Security.SIGNED},
-                        extra={"exchange": exchange, "orders": [o for o in active if o.symbol == symbol]},
-                    )
+                path = "/papi/v1/margin/openOrders"
+
             else:
-                self.add_request(
-                    "GET", f"/papi/v1/{market}/openOrders", callback=self.on_query_order,
-                    data={"security": Security.SIGNED}, extra={"exchange": exchange, "orders": active},
-                )
+                path = f"/papi/v1/{market}/openOrders"
+
+            self.add_request(
+                "GET",
+                path,
+                callback=self.on_query_order,
+                data={"security": Security.SIGNED},
+                extra={"exchange": exchange, "orders": active},
+            )
 
     def on_query_order(self, data: list, request: Request) -> None:
         exchange = request.extra["exchange"]
@@ -725,17 +768,23 @@ class BinanceOneRestApi(RestClient):
 
         timestamp = raw.get("updateTime") or raw.get("time") or self.get_timestamp()
         order = OrderData(
-            symbol=raw["symbol"], exchange=exchange,
+            symbol=raw["symbol"],
+            exchange=exchange,
             orderid=orderid or local_orderid(raw["symbol"], exchange, str(raw["clientOrderId"])),
-            type=order_type, direction=DIRECTION_BINANCEONE2VT[raw["side"]],
-            price=float(raw.get("price") or 0), volume=float(raw["origQty"]), traded=float(raw["executedQty"]),
-            status=status, datetime=generate_datetime(timestamp), gateway_name=self.gateway_name,
+            type=order_type,
+            direction=DIRECTION_BINANCEONE2VT[raw["side"]],
+            price=float(raw.get("price") or 0),
+            volume=float(raw["origQty"]),
+            traded=float(raw["executedQty"]),
+            status=status,
+            datetime=generate_datetime(timestamp),
+            gateway_name=self.gateway_name,
         )
         if exchange != Exchange.BINANCE and is_true(raw.get("reduceOnly")):
             order.offset = Offset.CLOSE
         order.extra = {"update_time": int(timestamp), "binance_order_id": raw.get("orderId")}
         return order
-    
+
     def _new_order_id(self) -> int:
         """
         返回加线程锁的order_count
@@ -743,35 +792,41 @@ class BinanceOneRestApi(RestClient):
         with self.gateway.order_lock:
             self.order_count += 1
             return self.order_count
-        
+
     def send_order(self, req: OrderRequest) -> str:
         self.count_datetime = int(datetime.now(TZ_INFO).strftime("%Y%m%d%H%M%S"))
-        client_id = req.symbol + "-" + str(self.count_datetime) + str(self._new_order_id()).rjust(8,"0")
+        client_id = req.symbol + "-" + str(self.count_datetime) + str(self._new_order_id()).rjust(8, "0")
         order = req.create_order_data(local_orderid(req.symbol, req.exchange, client_id), self.gateway_name)
         self.gateway.on_order(order)
 
         order_type, time_condition = ORDERTYPE_VT2BINANCEONE[req.type]
         params = {
-            "symbol": req.symbol, "side": DIRECTION_VT2BINANCEONE[req.direction], "type": order_type,
-            "quantity": format_number(req.volume), "newClientOrderId": client_id, "newOrderRespType": "RESULT",
+            "symbol": req.symbol,
+            "side": DIRECTION_VT2BINANCEONE[req.direction],
+            "type": order_type,
+            "quantity": format_number(req.volume),
+            "newClientOrderId": client_id,
+            "newOrderRespType": "RESULT",
         }
         if time_condition:
             params.update(price=format_number(req.price), timeInForce=time_condition)
         if req.exchange == Exchange.BINANCE:
-            # 只有开仓才允许自动借币
-            if req.offset == Offset.OPEN:
-                params["sideEffectType"] = "AUTO_BORROW_REPAY"
-                params["autoRepayAtCancel"] = "true"
-            else:
-                params["sideEffectType"] = "AUTO_REPAY"
+            params["sideEffectType"] = "AUTO_BORROW_REPAY"
+            params["autoRepayAtCancel"] = "true"
         else:
             params["positionSide"] = "BOTH"
             if req.offset in CLOSE_OFFSETS:
                 params["reduceOnly"] = "true"
+
         self.add_request(
-            "POST", f"/papi/v1/{MARKET_NAMES[req.exchange]}/order", callback=self.on_send_order,
-            data={"security": Security.SIGNED}, params=params, extra=order,
-            on_error=self.on_send_order_error, on_failed=self.on_send_order_failed,
+            "POST",
+            f"/papi/v1/{MARKET_NAMES[req.exchange]}/order",
+            callback=self.on_send_order,
+            data={"security": Security.SIGNED},
+            params=params,
+            extra=order,
+            on_error=self.on_send_order_error,
+            on_failed=self.on_send_order_failed,
         )
         return order.vt_orderid
 
@@ -814,9 +869,13 @@ class BinanceOneRestApi(RestClient):
             self.gateway.write_log("BINANCEONE撤单失败：市场不支持或时间同步未完成")
             return None
         return self.add_request(
-            "DELETE", f"/papi/v1/{MARKET_NAMES[req.exchange]}/order", callback=self.on_cancel_order,
+            "DELETE",
+            f"/papi/v1/{MARKET_NAMES[req.exchange]}/order",
+            callback=self.on_cancel_order,
             params={"symbol": req.symbol, "origClientOrderId": client_orderid(req.symbol, req.exchange, req.orderid)},
-            data={"security": Security.SIGNED}, extra=req, on_failed=self.on_cancel_failed,
+            data={"security": Security.SIGNED},
+            extra=req,
+            on_failed=self.on_cancel_failed,
         )
 
     def on_cancel_order(self, data: dict, request: Request) -> None:
@@ -840,8 +899,11 @@ class BinanceOneRestApi(RestClient):
         if exchange not in FUTURES_EXCHANGES or not self.time_synced:
             return None
         return self.add_request(
-            "POST", f"/papi/v1/{MARKET_NAMES[exchange]}/leverage", callback=self.on_leverage,
-            data={"security": Security.SIGNED}, params={"symbol": symbol, "leverage": 10},
+            "POST",
+            f"/papi/v1/{MARKET_NAMES[exchange]}/leverage",
+            callback=self.on_leverage,
+            data={"security": Security.SIGNED},
+            params={"symbol": symbol, "leverage": 10},
         )
 
     def on_leverage(self, data: dict, request: Request) -> None:
@@ -852,8 +914,12 @@ class BinanceOneRestApi(RestClient):
             return None
         self.stream_pending = True
         return self.add_request(
-            "POST", "/papi/v1/listenKey", callback=self.on_start_user_stream, data={"security": Security.API_KEY},
-            on_failed=self.on_stream_failed, on_error=self.on_stream_error,
+            "POST",
+            "/papi/v1/listenKey",
+            callback=self.on_start_user_stream,
+            data={"security": Security.API_KEY},
+            on_failed=self.on_stream_failed,
+            on_error=self.on_stream_error,
         )
 
     def on_start_user_stream(self, data: dict, request: Request) -> None:
@@ -875,8 +941,12 @@ class BinanceOneRestApi(RestClient):
             return
         self.stream_pending = True
         self.add_request(
-            "PUT", "/papi/v1/listenKey", callback=self.on_keep_user_stream, data={"security": Security.API_KEY},
-            on_failed=self.on_stream_failed, on_error=self.on_stream_error,
+            "PUT",
+            "/papi/v1/listenKey",
+            callback=self.on_keep_user_stream,
+            data={"security": Security.API_KEY},
+            on_failed=self.on_stream_failed,
+            on_error=self.on_stream_error,
         )
 
     def on_keep_user_stream(self, data: dict, request: Request) -> None:
@@ -921,10 +991,14 @@ class BinanceOneRestApi(RestClient):
         while start_time <= end:
             end_time = min(start_time + interval * limit - timedelta(milliseconds=1), end)
             response = self.public_rest_apis[req.exchange].request(
-                "GET", PUBLIC_PATHS[req.exchange] + "/klines",
+                "GET",
+                PUBLIC_PATHS[req.exchange] + "/klines",
                 params={
-                    "symbol": req.symbol, "interval": INTERVAL_VT2BINANCEONE[req.interval], "limit": limit,
-                    "startTime": int(start_time.timestamp() * 1000), "endTime": int(end_time.timestamp() * 1000),
+                    "symbol": req.symbol,
+                    "interval": INTERVAL_VT2BINANCEONE[req.interval],
+                    "limit": limit,
+                    "startTime": int(start_time.timestamp() * 1000),
+                    "endTime": int(end_time.timestamp() * 1000),
                 },
             )
             if response is None or response.status_code // 100 != 2:
@@ -937,12 +1011,20 @@ class BinanceOneRestApi(RestClient):
             for raw in data:
                 dt = generate_datetime(raw[0])
                 if req.start <= dt <= end:
-                    history.append(BarData(
-                        symbol=req.symbol, exchange=req.exchange, datetime=dt, interval=req.interval,
-                        volume=float(raw[7] if req.exchange == Exchange.BINANCEF else raw[5]),  # BINANCE，BINANCEF为币的成交量，
-                        open_price=float(raw[1]), high_price=float(raw[2]), low_price=float(raw[3]),
-                        close_price=float(raw[4]), gateway_name=self.gateway_name,
-                    ))
+                    history.append(
+                        BarData(
+                            symbol=req.symbol,
+                            exchange=req.exchange,
+                            datetime=dt,
+                            interval=req.interval,
+                            volume=float(raw[7] if req.exchange == Exchange.BINANCEF else raw[5]),  # BINANCE，BINANCEF为币的成交量，
+                            open_price=float(raw[1]),
+                            high_price=float(raw[2]),
+                            low_price=float(raw[3]),
+                            close_price=float(raw[4]),
+                            gateway_name=self.gateway_name,
+                        )
+                    )
             next_start = generate_datetime(data[-1][0]) + interval
             if next_start <= start_time:
                 self.gateway.write_log(f"{req.vt_symbol}历史分页未前进，停止查询")
@@ -950,9 +1032,12 @@ class BinanceOneRestApi(RestClient):
             start_time = next_start
         if history:
             from vnpy.trader.database import database_manager
+
             try:
                 database_manager.save_bar_data(history, False)
-                self.gateway.write_log(f"载入{req.vt_symbol}：bar数据，开始时间：{history[0].datetime}，结束时间：{history[-1].datetime}，数据量：{len(history)}，耗时{monotonic() - started:.3f}秒")
+                self.gateway.write_log(
+                    f"载入{req.vt_symbol}：bar数据，开始时间：{history[0].datetime}，结束时间：{history[-1].datetime}，数据量：{len(history)}，耗时{monotonic() - started:.3f}秒"
+                )
             except Exception as exc:
                 self.gateway.write_log(f"{req.vt_symbol}历史数据保存失败：{exc}")
 
@@ -1022,8 +1107,12 @@ class BinanceOneTradeWebsocketApi(WebsocketClient):
         exchange = BUSINESS_EXCHANGES.get(packet.get("fs"))
         for raw in packet.get("a", {}).get("P", []):
             self.gateway.rest_api.create_position_pair(
-                raw["s"], exchange, float(raw["pa"]), float(raw["ep"]),
-                float(raw.get("up", 0)), position_side=raw.get("ps", "BOTH"),
+                raw["s"],
+                exchange,
+                float(raw["pa"]),
+                float(raw["ep"]),
+                float(raw.get("up", 0)),
+                position_side=raw.get("ps", "BOTH"),
             )
 
     def on_order(self, packet: dict) -> None:
@@ -1046,10 +1135,17 @@ class BinanceOneTradeWebsocketApi(WebsocketClient):
         status = STATUS_BINANCEONE2VT[raw["X"]]
 
         order = OrderData(
-            symbol=raw["s"], exchange=exchange, orderid=local_orderid(raw["s"], exchange, str(raw["c"])),
-            type=order_type, direction=DIRECTION_BINANCEONE2VT[raw["S"]],
-            price=float(raw["p"]), volume=float(raw["q"]), traded=float(raw["z"]), status=status,
-            datetime=generate_datetime(timestamp), gateway_name=self.gateway_name,
+            symbol=raw["s"],
+            exchange=exchange,
+            orderid=local_orderid(raw["s"], exchange, str(raw["c"])),
+            type=order_type,
+            direction=DIRECTION_BINANCEONE2VT[raw["S"]],
+            price=float(raw["p"]),
+            volume=float(raw["q"]),
+            traded=float(raw["z"]),
+            status=status,
+            datetime=generate_datetime(timestamp),
+            gateway_name=self.gateway_name,
         )
 
         order.extra = {"update_time": timestamp, "binance_order_id": raw.get("i")}
@@ -1064,9 +1160,15 @@ class BinanceOneTradeWebsocketApi(WebsocketClient):
 
         latest = self.gateway.get_order(order.vt_orderid)
         trade = TradeData(
-            symbol=order.symbol, exchange=exchange, orderid=order.orderid, tradeid=tradeid,
-            direction=order.direction, offset=latest.offset if latest else order.offset,
-            price=float(raw["L"]), volume=volume, datetime=generate_datetime(raw.get("T", timestamp)),
+            symbol=order.symbol,
+            exchange=exchange,
+            orderid=order.orderid,
+            tradeid=tradeid,
+            direction=order.direction,
+            offset=latest.offset if latest else order.offset,
+            price=float(raw["L"]),
+            volume=volume,
+            datetime=generate_datetime(raw.get("T", timestamp)),
             gateway_name=self.gateway_name,
         )
         trade.extra = {"commission": float(raw.get("n") or 0), "commission_asset": raw.get("N")}
@@ -1082,9 +1184,7 @@ class BinanceOneDataWebsocketApi:
         self.ticks: dict[str, TickData] = {}
         self.subscribed: dict[str, SubscribeRequest] = {}
         self.tick_lock = Lock()
-        self.connections = {
-            key: BinanceOneMarketWebsocketApi(self, *key) for key in DATA_HOSTS
-        }
+        self.connections = {key: BinanceOneMarketWebsocketApi(self, *key) for key in DATA_HOSTS}
 
     def connect(self, proxy_host: str, proxy_port: int, server: str) -> None:
         if server != "REAL":
@@ -1105,8 +1205,11 @@ class BinanceOneDataWebsocketApi:
             self.subscribed[req.vt_symbol] = req
             if req.vt_symbol not in self.ticks:
                 self.ticks[req.vt_symbol] = TickData(
-                    symbol=req.symbol, exchange=req.exchange, name=get_symbol_mark(req.vt_symbol),
-                    datetime=datetime.now(TZ_INFO), gateway_name=self.gateway_name,
+                    symbol=req.symbol,
+                    exchange=req.exchange,
+                    name=get_symbol_mark(req.vt_symbol),
+                    datetime=datetime.now(TZ_INFO),
+                    gateway_name=self.gateway_name,
                 )
         if self.gateway.publish_status:
             for (exchange, _), api in self.connections.items():
@@ -1123,7 +1226,7 @@ class BinanceOneDataWebsocketApi:
             tick = self.ticks.get(vt_symbol)
             if tick is None:
                 return
-            timestamp = data.get("T",data.get("E",self.gateway.rest_api.get_timestamp()))     #T 成交时间，E事件时间，首选T，T缺失再选E
+            timestamp = data.get("T", data.get("E", self.gateway.rest_api.get_timestamp()))  # T 成交时间，E事件时间，首选T，T缺失再选E
             tick.datetime = generate_datetime(timestamp) if timestamp else datetime.now(TZ_INFO)
             if channel == "miniTicker":
                 # CM的v是张数、q是基础币数量；现货和UM的v才是基础币数量。
@@ -1196,7 +1299,7 @@ class BinanceOneMarketWebsocketApi(WebsocketClient):
         if self.category != "market":
             params.append(symbol + "@depth5@100ms")
             # 逐笔一档深度
-            #params.append(symbol + "@bookTicker")
+            # params.append(symbol + "@bookTicker")
         if self.category != "public":
             params.append(symbol + "@miniTicker")
             if self.gateway.book_trade_status:
